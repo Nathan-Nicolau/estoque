@@ -1,0 +1,34 @@
+server:
+  port: 8082
+
+spring:
+  application:
+    name: estoque
+  # Configuração do Banco em Memória (H2)
+  h2:
+    console:
+      enabled: true
+  datasource:
+    url: jdbc:h2:mem:estoquedb
+    driverClassName: org.h2.Driver
+    username: sa
+    password:
+  jpa:
+    database-platform: org.hibernate.dialect.H2Dialect
+    hibernate:
+      ddl-auto: update # Cria as tabelas automaticamente para o estudo
+    show-sql: true
+
+  # Configuração do Consumidor Kafka
+  kafka:
+    consumer:
+      bootstrap-servers: localhost:9092
+      group-id: grupo-estoque
+      auto-offset-reset: earliest # Se ligar agora, lê os pedidos que já estão no tópico
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        # Essencial: Permite desserializar o JSON mesmo que a classe Pedido esteja em pacotes diferentes nos dois projetos
+        spring.json.trusted.packages: "*"
+        spring.json.use.type.headers: false
+        spring.json.value.default.type: nathan.pedidos.api.estoque.model.PedidoEvent
