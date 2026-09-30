@@ -25,6 +25,26 @@ public class PedidoConsumerService {
         this.produtoRepository = produtoRepository;
     }
 
+    /**
+     * Explicação do processo de envio de mensagem ao DLQ
+     *
+     * 1. A Falha no Consumo:
+     *   O método @KafkaListener lê a mensagem do tópico original (pedidos-criados). Ao identificar que não há estoque suficiente, o seu código lança uma RuntimeException.
+     *   2. O Ciclo de Retentativas (Retry):
+     *   A anotação @RetryableTopic intercepta essa exceção. Em vez de descartar a mensagem ou travar a fila, ela suspende temporariamente e repete o processamento respeitando o @BackOff (espera 2s na 2ª
+     *   tentativa e 3s na 3ª tentativa).
+     *   3. A Publicação Física na DLT:
+     *   Ao falhar na 3ª tentativa, o Spring Kafka desiste do tópico principal, comita o offset dele para não travar os próximos pedidos e publica a mensagem via rede em um novo tópico no broker Kafka: pedidos-
+     *   criados-dlt, incluindo cabeçalhos com o motivo do erro e o stacktrace.
+     *   4. O Consumo da DLT:
+     *   Durante a inicialização da aplicação, o Spring cria nos bastidores um segundo consumidor Kafka dedicado exclusivamente a monitorar o tópico pedidos-criados-dlt. Assim que a mensagem chega nele, esse
+     *   consumidor a lê e entrega para o método anotado com @DltHandler.
+     *   5. A Gravação no Arquivo de Erro:
+     *   O @DltHandler executa e envia o alerta para o logger dlt-logger. O logback-spring.xml reconhece esse identificador e grava a mensagem isolada no arquivo .txt do dia (erros-pedidos-criados-dlt-29-09-26.
+     *   txt).
+     *
+     * */
+
     // Temos o uso do RetryableTopic aqui para casos onde ocorrerem erros de processamento das mensagens
     // 3 tentativas ao total
     // Configuração de delay com o backoff

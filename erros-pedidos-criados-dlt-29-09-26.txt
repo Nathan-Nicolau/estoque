@@ -1,0 +1,1 @@
+2026-09-29 22:52:29.784 [org.springframework.kafka.KafkaListenerEndpointContainer#0-dlt-0-C-1] ERROR dlt-logger - 🚨 [DLQ] Pedido rejeitado definitivamente após tentativas esgotadas. Pedido: Monitor Gamer 144hz | ID Pedido: 1790733143112 | Produto ID: 105 | Qtd: 99
