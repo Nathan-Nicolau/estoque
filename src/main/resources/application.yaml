@@ -32,3 +32,10 @@ spring:
         spring.json.trusted.packages: "*"
         spring.json.use.type.headers: false
         spring.json.value.default.type: nathan.pedidos.api.estoque.model.PedidoEvent
+    producer:
+      # Aponta para o broker local (Servidor Kafka) no container Docker
+      bootstrap-servers: localhost:9092
+      # Como transformar a "chave" da mensagem em bytes (geralmente String)
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      # Como transformar o "valor" (o objeto Pedido) em bytes. O JsonSerializer do Spring faz isso automaticamente.
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
