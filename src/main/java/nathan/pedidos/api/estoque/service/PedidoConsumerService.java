@@ -4,8 +4,10 @@ import jakarta.transaction.Transactional;
 import nathan.pedidos.api.estoque.exception.EstoqueInsuficienteException;
 import nathan.pedidos.api.estoque.exception.ProdutoNaoEncontradoException;
 import nathan.pedidos.api.estoque.model.PedidoEvent;
+import nathan.pedidos.api.estoque.model.PedidoProcessado;
 import nathan.pedidos.api.estoque.model.PedidoStatusEvent;
 import nathan.pedidos.api.estoque.model.Produto;
+import nathan.pedidos.api.estoque.repository.PedidoProcessadoRepository;
 import nathan.pedidos.api.estoque.repository.ProdutoRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,6 +22,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Date;
 import java.util.UUID;
 
 @Service
@@ -36,12 +39,15 @@ public class PedidoConsumerService {
     private final KafkaTemplate<String, PedidoStatusEvent> kafkaTemplate;
 
     private static final String topicoStatus = "pedidos-status";
+    private static final String topicoPedidosJaProcessados = "pedidos-ja-processados"; // Tópico exclusivo para a parte de idempotência
 
     private final ProdutoRepository produtoRepository;
+    private final PedidoProcessadoRepository pedidoProcessadoRepository;
 
-    public PedidoConsumerService(KafkaTemplate<String, PedidoStatusEvent> kafkaTemplate, ProdutoRepository produtoRepository) {
+    public PedidoConsumerService(KafkaTemplate<String, PedidoStatusEvent> kafkaTemplate, ProdutoRepository produtoRepository, PedidoProcessadoRepository pedidoProcessadoRepository) {
         this.kafkaTemplate = kafkaTemplate;
         this.produtoRepository = produtoRepository;
+        this.pedidoProcessadoRepository = pedidoProcessadoRepository;
     }
 
     /**
@@ -62,26 +68,31 @@ public class PedidoConsumerService {
     public void processarPedido(PedidoEvent pedido) {
         log.info("📥 Recebendo pedido via Kafka: {} (ID: {})", pedido.getDescricao(), pedido.getPedidoId());
 
-        // Busca o produto no banco pelo ID vindo do evento
-        Produto produto = produtoRepository.findById(pedido.getProdutoId())
-                .orElseThrow(() -> {
-                    String erro = "Produto não encontrado no estoque para o ID: " + pedido.getProdutoId();
-                    log.warn("⚠️ {}", erro);
-                    // Lança exceção específica que não sofrerá retentativas desnecessárias
-                    return new ProdutoNaoEncontradoException(erro);
-                });
+        // Antes de validar a existência do Produto e se ele de fato possui estoque, vamos validar se o pedido em sí já não foi processado
+        if(mensagemPedidoAindaNaoProcessada(pedido.getPedidoId())) {
+            // Busca o produto no banco pelo ID vindo do evento
+            Produto produto = produtoRepository.findById(pedido.getProdutoId())
+                    .orElseThrow(() -> {
+                        String erro = "Produto não encontrado no estoque para o ID: " + pedido.getProdutoId();
+                        log.warn("⚠️ {}", erro);
+                        // Lança exceção específica que não sofrerá retentativas desnecessárias
+                        return new ProdutoNaoEncontradoException(erro);
+                    });
 
-        // Verifica se há estoque suficiente
-        if (produto.getQuantidadeDisponivel() >= pedido.getQuantidade()) {
-            produto.setQuantidadeDisponivel(produto.getQuantidadeDisponivel() - pedido.getQuantidade());
-            produtoRepository.save(produto);
-            log.info("✅ Estoque atualizado com sucesso. Produto: {}, Nova quantidade: {}", produto.getNome(), produto.getQuantidadeDisponivel());
-            enviarConfirmacaoPedido(pedido);
+            // Verifica se há estoque suficiente
+            if (produto.getQuantidadeDisponivel() >= pedido.getQuantidade()) {
+                produto.setQuantidadeDisponivel(produto.getQuantidadeDisponivel() - pedido.getQuantidade());
+                produtoRepository.save(produto);
+                log.info("✅ Estoque atualizado com sucesso. Produto: {}, Nova quantidade: {}", produto.getNome(), produto.getQuantidadeDisponivel());
+                enviarConfirmacaoPedido(pedido);
+            } else {
+                String erroEstoque = "Estoque insuficiente para o produto: " + produto.getNome() + " (Disponível: " + produto.getQuantidadeDisponivel() + ", Solicitado: " + pedido.getQuantidade() + ")";
+                log.warn("❌ {}", erroEstoque);
+                // Lança exceção de negócio para estoque insuficiente
+                throw new EstoqueInsuficienteException(erroEstoque);
+            }
         } else {
-            String erroEstoque = "Estoque insuficiente para o produto: " + produto.getNome() + " (Disponível: " + produto.getQuantidadeDisponivel() + ", Solicitado: " + pedido.getQuantidade() + ")";
-            log.warn("❌ {}", erroEstoque);
-            // Lança exceção de negócio para estoque insuficiente
-            throw new EstoqueInsuficienteException(erroEstoque);
+            enviarMensagemPedidoJaProcessado(pedido);
         }
     }
 
@@ -93,6 +104,11 @@ public class PedidoConsumerService {
 
         String chaveMessage = UUID.randomUUID().toString();
         kafkaTemplate.send(topicoStatus, chaveMessage, status);
+
+        // Aqui é criado o registro para controle de idempotência no banco de dados da aplicação
+        var pedidoProcessado = new PedidoProcessado(pedido.getPedidoId(),new Date());
+        pedidoProcessadoRepository.saveAndFlush(pedidoProcessado);
+
     }
 
     // Processamento e auditoria de mensagens que esgotaram todas as retentativas ou caíram direto na DLT
@@ -117,17 +133,28 @@ public class PedidoConsumerService {
         
         // Registra também no log geral da aplicação
         log.error(logDetalhado);
-
-        String dataFormatada = LocalDateTime.now().format(FORMATADOR_DATA);
-
         // Envia o feedback à Frente com o status REPROVADO e o motivo real (produto inexistente ou estoque insuficiente)
-        var pedidoStatusReprovado = new PedidoStatusEvent(
+        var pedidoStatusReprovado = gerarPedidoReprovado(pedido, motivoReal);
+        kafkaTemplate.send(topicoStatus, pedido.getPedidoId().toString(), pedidoStatusReprovado);
+    }
+
+    private PedidoStatusEvent gerarPedidoReprovado(PedidoEvent pedido, String motivo) {
+        return new PedidoStatusEvent(
                 pedido.getPedidoId(),
                 "REPROVADO",
-                motivoReal,
-                dataFormatada
+                motivo,
+                LocalDateTime.now().format(FORMATADOR_DATA)
         );
-        kafkaTemplate.send(topicoStatus, pedido.getPedidoId().toString(), pedidoStatusReprovado);
+    }
+
+    public boolean mensagemPedidoAindaNaoProcessada(Long pedidoId) {
+        return !pedidoProcessadoRepository.existsById(pedidoId);
+    }
+
+    public void enviarMensagemPedidoJaProcessado(PedidoEvent pedido) {
+        String chavePedido = String.valueOf(pedido.getPedidoId());
+        String motivoDuplicidade = String.format("O pedido de ID %d já foi processado anteriormente e não pode ser reprocessado.", pedido.getPedidoId());
+        kafkaTemplate.send(topicoPedidosJaProcessados, chavePedido, gerarPedidoReprovado(pedido, motivoDuplicidade));
     }
 
 
